@@ -1,0 +1,6 @@
+[package]
+name = "ternary-speculate"
+version = "0.1.0"
+edition = "2021"
+description = "Speculative sync for ternary rooms — simulate confirmations, shadow partners, hint vectors, self-syncing T-minus events"
+license = "MIT"
