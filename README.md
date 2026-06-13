@@ -1,72 +1,135 @@
 # ternary-speculate
 
-**Speculative synchronization: never wait, simulate instead.**
+Speculative synchronization for **ternary agent coordination**. Never wait — simulate instead. Each room (agent) maintains three layers: an **execution layer** (what it's doing), a **speculation layer** (what it predicts partners will do), and a **shadow layer** (how things look from each partner's viewpoint).
 
-When two agents need to coordinate, the naive approach is: agent A sends a message, agent B receives it, B sends confirmation, A waits. This is *synchronous* — and it's slow because agents spend time waiting instead of working.
+## Why It Matters
 
-Speculative sync flips this: agent A doesn't wait for B's confirmation. Instead, it *simulates* what B would say and proceeds on that assumption. When B's actual response arrives, A checks: was my speculation correct? If yes (hint = OnTrack), no time was wasted. If no (hint = OffTrack), A rolls back and re-syncs.
+Distributed systems typically coordinate via blocking (barriers, locks) or polling (heartbeat, consensus rounds). Both add latency. Speculative sync eliminates wait time by having each agent **simulate its partners** and proceed optimistically:
 
-This is the same architecture as CPU branch prediction, optimistic database transactions, and speculative execution in processors. Applied to multi-agent coordination.
+| Layer | Signal | Role |
+|-------|--------|------|
+| Execution | Actual state | What this room is doing now |
+| Speculation | Predicted responses | What partners would say if asked |
+| Shadow | Simulated partner models | How the world looks from each partner |
 
-## What's Inside
+When reality arrives, shadows are **reconciled** (T+1 to T+3 ticks later). Correct predictions reinforce confidence; incorrect ones trigger re-simulation. This is essentially **speculative execution** (as in CPU branch prediction) applied to multi-agent coordination.
 
-- **`Hint`** — ternary speculation feedback: `OnTrack (+1)`, `Neutral (0)`, `OffTrack (-1)`
-- **`HintVector`** — hints from multiple sources: self, echo, shadow, rhythm
-- **`SpeculativeLayer`** — for each room: execution state, speculation state, shadow state
-- **`simulate_partners(state, room_ids)`** — predict what partners would say
-- **`confirm(speculation, actual)`** — compare prediction with reality, produce Hint
-- **`rollback(state, checkpoint)`** — revert to checkpoint if speculation was wrong
+## How It Works
 
-## Quick Example
+### Hint Vectors
+
+Each room aggregates hints from four sources into a ternary signal vector:
+
+| Hint Type | Source | Values |
+|-----------|--------|--------|
+| Self | Internal consistency | +1 = coherent, -1 = broken |
+| Echo | Bounced output check | +1 = echoed, -1 = dropped |
+| Shadow | Simulation vs reality | +1 = matched, -1 = diverged |
+| Rhythm | Phase alignment | +1 = in-phase, -1 = out-of-phase |
+
+**Aggregate score:**
+
+```
+H = mean(all_hints) ∈ [-1, +1]
+```
+
+`H < 0` triggers `needs_resimulation()`.
+
+### Shadow Tracking
+
+Each `Shadow` models one partner's expected state:
+
+```
+expected_position: i8     // predicted next position
+expected_velocity: f64     // predicted rate of change
+confidence: f64            // [0, 1] — hit rate
+hits, misses: u64          // prediction accuracy
+```
+
+**Reconciliation** compares prediction to reality:
+
+```
+pos_error = |actual_position - expected_position|
+was_correct = (pos_error == 0)
+confidence = hits / (hits + misses)
+```
+
+**Complexity:** O(1) per shadow reconciliation.
+
+### Simulated Responses
+
+```
+uncertainty = 0  if confidence > 0.8
+            = 1  if confidence > 0.5
+            = 2  otherwise
+```
+
+High-confidence shadows produce sharp predictions; low-confidence shadows express uncertainty.
+
+### T-Minus Events
+
+Pre-scheduled events that fire at a specific tick:
+
+```
+should_fire(t) = (t ≥ fires_at) ∧ ¬fired
+t_minus(t) = fires_at - t
+```
+
+Events are self-syncing: the originating room can attach a `SimulatedResponse` speculation so partners can prepare. After firing, events are marked `reconciled` once confirmed.
+
+### Speculation Accuracy
+
+Overall room accuracy is the average shadow confidence:
+
+```
+speculation_accuracy = mean(confidence(s) for s in shadows)
+```
+
+This provides a single-number health metric for the speculation layer.
+
+## Quick Start
 
 ```rust
-use ternary_speculate::*;
+use ternary_speculate::{SpeculativeRoom, TMinusEvent, Hint};
 
-// Agent speculates about partner's response
-let my_state = 1; // I'm at +1
-let partner_id = 42;
+let mut room = SpeculativeRoom::new(0);
+room.add_shadow(1);  // model partner 1
+room.add_shadow(2);  // model partner 2
 
-// Simulate: "given I'm at +1, partner is probably at +1 too"
-let speculation = simulate_partner(my_state, partner_id);
+// Speculate what partners will do
+let predictions = room.speculate_all();
+assert_eq!(predictions.len(), 2);
 
-// ... proceed with work based on speculation ...
+// Reconcile with actual states
+let deltas = room.reconcile_shadows(&[(1, 0, 0.5), (2, -1, 0.0)]);
+// Shadows update confidence based on accuracy
 
-// Later: partner's actual response arrives
-let actual = -1; // partner is actually at -1
-
-// Confirm: was I right?
-let hint = confirm(speculation, actual);
-assert_eq!(hint, Hint::OffTrack); // speculation was wrong
-
-// Rollback if needed
-// ... restore to checkpoint and re-sync
+// Schedule a future event
+room.schedule(TMinusEvent::new(42, fires_at: 10, data: 1, room: 0));
+for _ in 0..10 { room.tick(); }
+let fired = room.fire_due();
+assert_eq!(fired.len(), 1);
 ```
 
-## The Deeper Truth
+## API
 
-**Speculation is a bet on regularity.** If the system is regular (agents behave predictably), speculation is almost always right and the system runs at full speed. If the system is chaotic (agents are unpredictable), speculation fails often and the rollback cost eats the savings. The ternary hint vector captures this: if hints are mostly +1 (on track), the system is predictable and speculation pays off. If hints are mostly -1 (off track), the system is chaotic and you should fall back to synchronous coordination.
+| Type | Key Methods |
+|------|-------------|
+| `SpeculativeRoom` | `add_shadow(id)`, `speculate_all()`, `reconcile_shadows(actuals)`, `check_hints()`, `fire_due()`, `tick()` |
+| `Shadow` | `reconcile(pos, vel)`, `simulate_response()`, `check_hint(actual)` |
+| `HintVector` | `self_hint(v)`, `echo_hint(v)`, `shadow_hint(v)`, `rhythm_hint(v)`, `aggregate()` |
+| `TMinusEvent` | `should_fire(tick)`, `t_minus(tick)` |
 
-The shadow state is the deepest layer: it's how things look *from the partner's perspective*. Not just "what would partner say?" but "what does partner think *I* would say?" This recursive modeling — I model you modeling me — is the foundation of theory of mind in multi-agent systems.
+## Architecture Notes
 
-**Use cases:**
-- **Distributed systems** — optimistic concurrency without locks
-- **Multi-agent coordination** — proceed on assumption, verify later
-- **Game AI** — model opponent's strategy, act on prediction, adjust on surprise
-- **Database transactions** — optimistic concurrency control
-- **Network protocols** — speculative acknowledgment
+The **γ + η = C** invariant is the design principle of the entire crate. *Generation* (γ) is the simulation layer producing predicted partner states. *Entropy* (η) is the hint divergence — when predictions are wrong, shadows accumulate misses and confidence drops (η↑). *Conservation* (C) is the invariant that every shadow must eventually be reconciled — speculative state is provisional, and the T-minus event system ensures reconciliation deadlines are met. When η exceeds the hint threshold (`has_failures()`), the room triggers re-simulation, restoring the γ-η balance.
 
-## See Also
+## References
 
-- **ternary-predict** — prediction-first perception (speculation's input)
-- **ternary-sync** — Z₃ synchronization (the fallback when speculation fails)
-- **ternary-trust** — trust determines when speculation is safe
-- **ternary-room** — the room model that speculative agents inhabit
-
-## Install
-
-```bash
-cargo add ternary-speculate
-```
+- **Speculative execution in CPUs:** Hennessy, J. & Patterson, D. *Computer Architecture* (2017), §3.3
+- **Optimistic replication:** Saito, Y. & Shapiro, M. "Optimistic Replication" (2005)
+- **Bayesian tracking:** Thrun, S., Burgard, W. & Fox, D. *Probabilistic Robotics* (2005)
+- **Eventual consistency:** Vogels, W. "Eventually Consistent" (2009)
 
 ## License
 
